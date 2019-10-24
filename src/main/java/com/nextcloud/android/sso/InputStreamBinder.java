@@ -33,6 +33,7 @@ import android.os.ParcelFileDescriptor;
 import android.text.TextUtils;
 import android.util.Log;
 
+import com.google.gson.Gson;
 import com.nextcloud.android.sso.aidl.IInputStreamService;
 import com.nextcloud.android.sso.aidl.NextcloudRequest;
 import com.nextcloud.android.sso.aidl.ParcelFileDescriptorUtil;
@@ -44,6 +45,7 @@ import com.owncloud.android.lib.common.OwnCloudClientManagerFactory;
 import com.owncloud.android.lib.common.utils.Log_OC;
 import com.owncloud.android.utils.EncryptionUtils;
 
+import org.apache.commons.httpclient.Header;
 import org.apache.commons.httpclient.HttpConnection;
 import org.apache.commons.httpclient.HttpMethodBase;
 import org.apache.commons.httpclient.HttpState;
@@ -69,6 +71,7 @@ import java.io.InputStreamReader;
 import java.io.ObjectInputStream;
 import java.io.ObjectOutputStream;
 import java.io.Serializable;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 
@@ -125,17 +128,12 @@ public class InputStreamBinder extends IInputStreamService.Stub {
         final InputStream requestBodyInputStream = requestBodyParcelFileDescriptor != null ?
             new ParcelFileDescriptor.AutoCloseInputStream(requestBodyParcelFileDescriptor) : null;
         Exception exception = null;
-        InputStream httpStream = new InputStream() {
-            @Override
-            public int read() {
-                return 0;
-            }
-        };
+        Response response = new Response();
 
         try {
             // Start request and catch exceptions
             NextcloudRequest request = deserializeObjectAndCloseStream(is);
-            httpStream = processRequest(request, requestBodyInputStream);
+            response = processRequest(request, requestBodyInputStream);
         } catch (Exception e) {
             Log_OC.e(TAG, "Error during Nextcloud request", e);
             exception = e;
@@ -143,13 +141,9 @@ public class InputStreamBinder extends IInputStreamService.Stub {
 
         try {
             // Write exception to the stream followed by the actual network stream
-            InputStream exceptionStream = serializeObjectToInputStream(exception);
-            InputStream resultStream;
-            if (httpStream != null) {
-                resultStream = new java.io.SequenceInputStream(exceptionStream, httpStream);
-            } else {
-                resultStream = exceptionStream;
-            }
+            InputStream exceptionStream = serializeObjectToInputStream(exception, response.getPlainHeadersString());
+            InputStream resultStream = new java.io.SequenceInputStream(exceptionStream, response.getInputStream());
+
             return ParcelFileDescriptorUtil.pipeFrom(resultStream, thread -> Log.d(TAG, "Done sending result"));
         } catch (IOException e) {
             Log_OC.e(TAG, "Error while sending response back to client app", e);
@@ -157,10 +151,13 @@ public class InputStreamBinder extends IInputStreamService.Stub {
         return null;
     }
 
-    private <T extends Serializable> ByteArrayInputStream serializeObjectToInputStream(T obj) throws IOException {
+    private <T extends Serializable> ByteArrayInputStream serializeObjectToInputStream(T obj,
+                                                                                       String headers)
+        throws IOException {
         ByteArrayOutputStream baos = new ByteArrayOutputStream();
         ObjectOutputStream oos = new ObjectOutputStream(baos);
         oos.writeObject(obj);
+        oos.writeObject(headers);
         oos.flush();
         oos.close();
         return new ByteArrayInputStream(baos.toByteArray());
@@ -250,7 +247,7 @@ public class InputStreamBinder extends IInputStreamService.Stub {
         return method;
     }
 
-    private InputStream processRequest(final NextcloudRequest request, final InputStream requestBodyInputStream)
+    private Response processRequest(final NextcloudRequest request, final InputStream requestBodyInputStream)
         throws UnsupportedOperationException,
         com.owncloud.android.lib.common.accounts.AccountUtils.AccountNotFoundException,
         OperationCanceledException, AuthenticatorException, IOException {
@@ -295,7 +292,7 @@ public class InputStreamBinder extends IInputStreamService.Stub {
 
         // Check if status code is 2xx --> https://en.wikipedia.org/wiki/List_of_HTTP_status_codes#2xx_Success
         if (status >= HTTP_STATUS_CODE_OK && status < HTTP_STATUS_CODE_MULTIPLE_CHOICES) {
-            return method.getResponseBodyAsStream();
+            return new Response(method.getResponseBodyAsStream(), method.getResponseHeaders());
         } else {
             StringBuilder total = new StringBuilder();
             InputStream inputStream = method.getResponseBodyAsStream();
@@ -349,5 +346,68 @@ public class InputStreamBinder extends IInputStreamService.Stub {
             result |= a[i] ^ b[i];
         }
         return result == 0;
+    }
+
+    private class Response {
+        private InputStream inputStream;
+        private Header[] headers;
+
+        public Response() {
+            headers = new Header[0];
+            inputStream = new InputStream() {
+                @Override
+                public int read() {
+                    return 0;
+                }
+            };
+        }
+
+        public Response(InputStream inputStream, Header[] headers) {
+            this.inputStream = inputStream;
+            this.headers = headers;
+        }
+
+        public String getPlainHeadersString() {
+            ArrayList<PlainHeader> arrayList = new ArrayList<>();
+
+            for (Header header : headers) {
+                arrayList.add(new PlainHeader(header.getName(), header.getValue()));
+            }
+
+            Gson gson = new Gson();
+            return gson.toJson(arrayList);
+        }
+
+        public InputStream getInputStream() {
+            return inputStream;
+        }
+    }
+
+    private class PlainHeader implements Serializable {
+        private String name;
+        private String value;
+
+        PlainHeader(String name, String value) {
+            this.name = name;
+            this.value = value;
+        }
+
+        public String getName() {
+            return name;
+        }
+
+        public String getValue() {
+            return value;
+        }
+
+        private void writeObject(ObjectOutputStream oos) throws IOException {
+            oos.writeObject(name);
+            oos.writeObject(value);
+        }
+
+        private void readObject(ObjectInputStream in) throws IOException, ClassNotFoundException {
+            name = (String) in.readObject();
+            value = (String) in.readObject();
+        }
     }
 }
